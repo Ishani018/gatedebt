@@ -113,3 +113,26 @@ def test_foreign_keys_enforced(store):
         with store.transaction() as conn:
             store.insert_evidence(conn, make_evidence(make_exception(id="EXC-404")), commit_origin="provided",
                                   working_tree_dirty=False, recorded_by="user:alice")
+
+
+def test_upgrade_from_schema_v1_preserves_data(tmp_path):
+    from app.store import MIGRATIONS, _split
+
+    path = tmp_path / "v1.sqlite3"
+    conn = sqlite3.connect(path, isolation_level=None)
+    for statement in _split(MIGRATIONS[0]):
+        conn.execute(statement)
+    conn.execute("PRAGMA user_version = 1")
+    exc = make_exception()
+    conn.execute(
+        "INSERT INTO exceptions (id, project, type, status, owner, expires_at, created_at, updated_at, record_json)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (exc.id, exc.project, exc.type.value, exc.status.value, exc.owner, "x", "x", "x", exc.model_dump_json()),
+    )
+    conn.close()
+    store = Store(path)
+    assert store.schema_version() == SCHEMA_VERSION == 2
+    with store.reader() as conn:
+        assert store.get_exception(conn, exc.id) == exc
+        triggers = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+    assert {"ci_verifications_no_update", "ci_verifications_no_delete"} <= triggers

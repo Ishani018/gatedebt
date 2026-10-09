@@ -59,6 +59,19 @@ class EvidenceView(BaseModel):
     provenance_issues: list[str]
     recorded_at: str
     recorded_by: str
+    ci_verification: dict[str, Any] | None = None
+
+
+class CiEvidenceRequest(BaseModel):
+    """Pointers only. Source, status, commit and report content are never
+    accepted from the caller; the server reads them from GitLab."""
+
+    model_config = ConfigDict(extra="forbid")
+    pipeline_id: int = Field(ge=1)
+    scenario_id: str = Field(pattern=r"^[a-z0-9-]{1,64}$")
+    project_id: int | None = Field(default=None, ge=1)
+    job_id: int | None = Field(default=None, ge=1)
+    commit_sha: CommitSha | None = None
 
 
 class RehearsalRequest(BaseModel):
@@ -138,6 +151,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "environment": settings.environment.value,
             "authentication": authenticator.name,
             "trusted_evidence_sources": sorted(s.value for s in settings.policy.trusted_sources),
+            "evidence_trust": settings.effective_trust.value,
+            "ci_verification": "configured" if settings.ci_verification_configured else "not configured",
             "schema_version": store.schema_version(),
         }
 
@@ -169,6 +184,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             verdict=report.verdict, failures=report.failures, provenance_issues=issues,
             execution_note=report.execution_note, evidence=report.evidence,
         )
+
+    @app.post("/exceptions/{exception_id}/ci-evidence", status_code=201)
+    def ingest_ci_evidence(exception_id: ExceptionIdPath, body: CiEvidenceRequest, who: IdentityDep) -> EvidenceView:
+        row = lifecycle.ingest_ci_evidence(
+            exception_id, who, pipeline_id=body.pipeline_id, scenario_id=body.scenario_id,
+            project_id=body.project_id, job_id=body.job_id, expected_commit=body.commit_sha,
+        )
+        return EvidenceView(**row)
 
     @app.post("/exceptions/{exception_id}/retirement-proposal", status_code=201)
     def propose_retirement(exception_id: ExceptionIdPath, body: ProposalRequest, who: IdentityDep) -> DecisionReport:

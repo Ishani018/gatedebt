@@ -50,6 +50,7 @@ class RunContext:
     pipeline_id: int | None = None
     job_id: int | None = None
     working_tree_dirty: bool | None = None
+    ci: "CiMetadata | None" = None
 
 
 class Recorder:
@@ -109,6 +110,23 @@ class Scenario(ABC):
         return (*cls.requirement.required_checks, cls.exercised_check)
 
 
+class CiMetadata(BaseModel):
+    """What the CI job said about itself (from GitLab predefined variables).
+
+    Self-reported: the GateDebt server never trusts these values on their own
+    and re-verifies them against the GitLab API before ingesting evidence.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: int
+    project_path: str | None = None
+    ref: str | None = None
+    job_name: str | None = None
+    pipeline_url: str | None = None
+    job_url: str | None = None
+
+
 class RehearsalReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -121,6 +139,7 @@ class RehearsalReport(BaseModel):
     execution_note: str
     evidence: EvidenceRecord
     log: list[str]
+    ci: CiMetadata | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -155,7 +174,8 @@ def _cleanup(scenario: Scenario | None, workdir: Path, rec: Recorder) -> Cleanup
 
 def execution_note(ctx: RunContext) -> str:
     if ctx.source == EvidenceSource.GITLAB_CI:
-        return f"GitLab CI execution (pipeline {ctx.pipeline_id}, job {ctx.job_id})."
+        project = f"project {ctx.ci.project_id}, " if ctx.ci else ""
+        return f"GitLab CI execution ({project}pipeline {ctx.pipeline_id}, job {ctx.job_id}); self-reported until verified."
     note = "Local sandbox execution on this machine. This is not a GitLab CI run."
     if ctx.commit_origin == "local_git_head":
         note += " Commit is the local git HEAD"
@@ -234,6 +254,7 @@ def run_rehearsal(
         execution_note=execution_note(ctx),
         evidence=evidence,
         log=rec.lines,
+        ci=ctx.ci,
     )
     report_path = run_dir / "report.json"
     report_path.write_text(report.model_dump_json(indent=2) + "\n")

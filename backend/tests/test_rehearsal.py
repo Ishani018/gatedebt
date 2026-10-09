@@ -430,7 +430,8 @@ def test_local_mode_uses_git_head_and_reports_dirty_tree(monkeypatch):
     assert ctx.source == EvidenceSource.LOCAL_SANDBOX
 
 
-CI_ENV = {"GITLAB_CI": "true", "CI_COMMIT_SHA": COMMIT, "CI_PIPELINE_ID": "4242", "CI_JOB_ID": "777"}
+CI_ENV = {"GITLAB_CI": "true", "CI_COMMIT_SHA": COMMIT, "CI_PIPELINE_ID": "4242", "CI_JOB_ID": "777",
+          "CI_PROJECT_ID": "31", "CI_COMMIT_REF_NAME": "main", "CI_JOB_NAME": "rehearse:pipeline-gate-recovery"}
 
 
 def test_gitlab_ci_context_comes_from_ci_environment():
@@ -444,6 +445,7 @@ def test_gitlab_ci_context_comes_from_ci_environment():
         ({**CI_ENV, "GITLAB_CI": ""}, None),
         ({**CI_ENV, "CI_JOB_ID": ""}, None),
         ({**CI_ENV, "CI_PIPELINE_ID": "-1"}, None),
+        ({**CI_ENV, "CI_PROJECT_ID": ""}, None),
         (CI_ENV, OTHER_COMMIT),
     ],
 )

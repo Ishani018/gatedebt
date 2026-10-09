@@ -28,11 +28,13 @@ from app.models import (
     utcnow,
 )
 from app.rehearsal import SCENARIOS, RehearsalReport, RunContext, run_rehearsal
+from app.services.ci_evidence import CiEvidenceRejected, verify_ci_evidence
 from app.services.decision import evaluate
 from app.services.policy import (
     REQUIRED_SCENARIOS,
     PolicyViolation,
     check_transition,
+    evidence_rejections,
     renewal_issues,
     retirement_issues,
 )
@@ -69,17 +71,35 @@ class Invalid(DomainError):
     status_code = 422
 
 
-def provenance_issues(commit_origin: str, working_tree_dirty: bool | None) -> list[str]:
+class Unavailable(DomainError):
+    status_code = 503
+
+
+def provenance_issues(
+    commit_origin: str,
+    working_tree_dirty: bool | None,
+    source: EvidenceSource | None = None,
+    ci_verified: bool = False,
+) -> list[str]:
     """Source-state rules for stored evidence, applied before the policy engine.
 
     A run from a working tree with uncommitted changes did not execute the
-    commit it names, so it cannot count as evidence for that commit.
+    commit it names, so it cannot count as evidence for that commit. Evidence
+    labelled ``gitlab_ci`` counts only if this server verified it with GitLab.
     """
+    if source == EvidenceSource.GITLAB_CI and not ci_verified:
+        return ["EVIDENCE_CI_PROVENANCE_UNVERIFIED"]
     if working_tree_dirty:
         return ["EVIDENCE_UNCOMMITTED_SOURCE"]
     if commit_origin == "local_git_head" and working_tree_dirty is None:
         return ["EVIDENCE_SOURCE_STATE_UNKNOWN"]
     return []
+
+
+def _row_issues(row: dict[str, Any]) -> list[str]:
+    return provenance_issues(
+        row["commit_origin"], row["working_tree_dirty"], row["evidence"].source, row["ci_verification"] is not None
+    )
 
 
 class Lifecycle:
@@ -145,9 +165,11 @@ class Lifecycle:
     def _decide(self, conn, exc: ExceptionRecord, commit: str, now: datetime) -> DecisionReport:
         usable, excluded = [], {}
         for row in self.store.list_evidence(conn, exc.id):
-            issues = provenance_issues(row["commit_origin"], row["working_tree_dirty"])
+            issues = _row_issues(row)
             if issues:
-                excluded[row["evidence"].id] = issues
+                # Report every problem, including the policy engine's own.
+                policy_reasons = evidence_rejections(row["evidence"], exc, commit, now, self.settings.policy)
+                excluded[row["evidence"].id] = [*issues, *(r for r in policy_reasons if r not in issues)]
             else:
                 usable.append(row["evidence"])
         try:
@@ -177,7 +199,7 @@ class Lifecycle:
             self._get(conn, exception_id)
             rows = self.store.list_evidence(conn, exception_id)
         for row in rows:
-            row["provenance_issues"] = provenance_issues(row["commit_origin"], row["working_tree_dirty"])
+            row["provenance_issues"] = _row_issues(row)
         return rows
 
     def approvals(self, exception_id: str) -> list[ApprovalRecord]:
@@ -256,6 +278,83 @@ class Lifecycle:
                  "provenance_issues": issues},
             )
         return report, issues
+
+    def ingest_ci_evidence(
+        self,
+        exception_id: str,
+        identity: Identity | None,
+        *,
+        pipeline_id: int,
+        scenario_id: str,
+        project_id: int | None = None,
+        job_id: int | None = None,
+        expected_commit: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch and verify a CI rehearsal report from GitLab, then store it.
+
+        The caller only points at a pipeline; every fact is re-read from the
+        GitLab API with the server's token. Storing evidence never changes the
+        exception's status.
+        """
+        identity = self._require_identity(identity)
+        settings = self.settings
+        if project_id is None:
+            if len(settings.gitlab_project_ids) != 1:
+                raise Invalid("CI_PROJECT_ID_REQUIRED")
+            project_id = next(iter(settings.gitlab_project_ids))
+        exc = self.get(exception_id)
+        if exc.status == ExceptionStatus.RETIRED:
+            raise Conflict("EXCEPTION_RETIRED")
+        scenario = SCENARIOS.get(scenario_id)
+        if scenario is None:
+            raise Invalid("UNKNOWN_SCENARIO")
+        if scenario.requirement not in REQUIRED_SCENARIOS[exc.type]:
+            raise Invalid("SCENARIO_NOT_REQUIRED_FOR_EXCEPTION_TYPE")
+
+        attempt = {"project_id": project_id, "pipeline_id": pipeline_id, "scenario_id": scenario_id,
+                   "job_id": job_id}
+        client = settings.gitlab_client()
+        if client is None:
+            raise self._deny(identity.actor, "evidence.ci_rejected", exc.id,
+                             Unavailable("CI_VERIFICATION_NOT_CONFIGURED"))
+        try:
+            verified = verify_ci_evidence(
+                client, project_id=project_id, pipeline_id=pipeline_id, scenario_id=scenario_id, exception=exc,
+                trusted_projects=settings.gitlab_project_ids, trusted_refs=settings.gitlab_trusted_refs,
+                policy=settings.policy, now=utcnow(), job_id=job_id, expected_commit=expected_commit,
+            )
+        except CiEvidenceRejected as err:
+            if err.unavailable:
+                error: DomainError = Unavailable(*err.reason_codes)
+            elif "CI_PROJECT_NOT_TRUSTED" in err.reason_codes:
+                error = Forbidden(*err.reason_codes)
+            else:
+                error = Invalid(*err.reason_codes)
+            with self.store.transaction() as conn:
+                self.store.append_audit(conn, identity.actor, "evidence.ci_rejected", exc.id,
+                                        {**attempt, "reason_codes": error.reason_codes})
+            raise error from None
+
+        evidence, provenance = verified.evidence, verified.provenance
+        try:
+            with self.store.transaction() as conn:
+                self._get(conn, exc.id)
+                if self.store.ci_job_ingested(conn, provenance.project_id, provenance.job_id):
+                    raise DuplicateError(f"CI job {provenance.job_id} already ingested")
+                # Evidence and its CI verification commit together or not at all.
+                self.store.insert_evidence(conn, evidence, commit_origin="gitlab_ci", working_tree_dirty=False,
+                                           recorded_by=identity.actor)
+                self.store.insert_ci_verification(conn, exc.id, evidence.id, provenance, identity.actor)
+                self.store.append_audit(conn, identity.actor, "evidence.ci_ingested", exc.id, {
+                    "evidence_id": evidence.id, "project_id": provenance.project_id,
+                    "pipeline_id": provenance.pipeline_id, "job_id": provenance.job_id, "ref": provenance.ref,
+                    "commit_sha": provenance.commit_sha, "scenario_id": scenario_id,
+                })
+        except DuplicateError:
+            raise self._deny(identity.actor, "evidence.ci_rejected", exc.id,
+                             Conflict("CI_EVIDENCE_DUPLICATE")) from None
+        [row] = [r for r in self.evidence(exc.id) if r["evidence"].id == evidence.id]
+        return row
 
     def propose_retirement(self, exception_id: str, commit: str | None, identity: Identity | None) -> DecisionReport:
         identity = self._require_identity(identity)

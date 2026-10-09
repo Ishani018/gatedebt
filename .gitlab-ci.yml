@@ -1,0 +1,136 @@
+# GateDebt CI/CD pipeline.
+#
+# Every job here is safe to run automatically. The rehearsal jobs inject
+# failures only into throwaway SQLite files and temporary directories inside
+# the job container. No job uses credentials, deploys, or touches any database
+# or service outside the container.
+#
+# Stages:
+#   validate  - byte-compile, scenario registry and fixture sanity
+#   test      - full pytest suite (JUnit report in the MR/pipeline UI)
+#   rehearse  - one job per approved scenario; writes a sealed evidence report
+#   evaluate  - self-check of the reports + JUnit view of every rehearsal check
+#
+# Trust: reports in this pipeline are self-reported. The GateDebt server only
+# accepts them after re-reading the pipeline, job and artifact through the
+# GitLab API (POST /exceptions/{id}/ci-evidence). A failed rehearsal fails its
+# job, which fails the pipeline, so it can never be ingested as evidence.
+#
+# Which exceptions the rehearsals are evidence for: set these when running the
+# pipeline (Build > Pipelines > Run pipeline > Variables), or keep the defaults.
+
+variables:
+  GATEDEBT_DB_EXCEPTION_ID:
+    value: "EXC-001"
+    description: "Exception the db-migration-recovery rehearsal is evidence for"
+  GATEDEBT_PIPELINE_EXCEPTION_ID:
+    value: "EXC-002"
+    description: "Exception the pipeline-gate-recovery rehearsal is evidence for"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+workflow:
+  rules:
+    # Avoid duplicate branch + merge request pipelines.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - validate
+  - test
+  - rehearse
+  - evaluate
+
+default:
+  image: python:3.12-slim
+  interruptible: true
+  timeout: 15 minutes
+  cache:
+    key:
+      files:
+        - backend/requirements.txt
+        - backend/requirements-dev.txt
+    paths:
+      - .cache/pip
+  before_script:
+    - python --version
+    - python -m pip install -r backend/requirements-dev.txt
+
+validate:
+  stage: validate
+  script:
+    - cd backend
+    - python -m compileall -q app
+    - python -m app.rehearsal list
+    - python -m json.tool ../scenarios/database-migration/fixture.json > /dev/null
+    - python -m json.tool ../scenarios/pipeline-recovery/fixture.json > /dev/null
+
+test:
+  stage: test
+  script:
+    - cd backend
+    - python -m pytest --junitxml="$CI_PROJECT_DIR/junit-tests.xml"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    reports:
+      junit: junit-tests.xml
+
+# Shared rehearsal job. The script always copies the report to a fixed path
+# (gatedebt-evidence/<scenario>.json) before exiting with the rehearsal's real
+# status: the report is published even on failure, but the job still fails.
+.rehearse:
+  stage: rehearse
+  needs: [test]
+  script:
+    - cd backend
+    - >
+      python -m app.rehearsal run "$SCENARIO_ID"
+      --exception-id "$EXCEPTION_ID"
+      --source gitlab_ci
+      --artifacts-dir "$CI_PROJECT_DIR/artifacts/runs"
+      --evidence-out "$CI_PROJECT_DIR/gatedebt-evidence/$SCENARIO_ID.json"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - gatedebt-evidence/
+      - artifacts/runs/
+
+# Job names are part of the trust contract: the server looks up
+# "rehearse:<scenario-id>" in the pipeline (app/services/ci_evidence.py).
+"rehearse:db-migration-recovery":
+  extends: .rehearse
+  variables:
+    SCENARIO_ID: db-migration-recovery
+    EXCEPTION_ID: $GATEDEBT_DB_EXCEPTION_ID
+
+"rehearse:pipeline-gate-recovery":
+  extends: .rehearse
+  variables:
+    SCENARIO_ID: pipeline-gate-recovery
+    EXCEPTION_ID: $GATEDEBT_PIPELINE_EXCEPTION_ID
+
+evidence-summary:
+  stage: evaluate
+  needs:
+    - job: "rehearse:db-migration-recovery"
+      artifacts: true
+    - job: "rehearse:pipeline-gate-recovery"
+      artifacts: true
+  # Runs (and fails) even when a rehearsal failed, so the summary is visible.
+  when: always
+  script:
+    - cd backend
+    - python -m app.rehearsal summarize "$CI_PROJECT_DIR/gatedebt-evidence" --out "$CI_PROJECT_DIR/gatedebt-summary"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - gatedebt-summary/
+    reports:
+      junit: gatedebt-summary/rehearsals-junit.xml

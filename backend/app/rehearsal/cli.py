@@ -23,7 +23,7 @@ from app.models import EvidenceSource
 from app.models.common import ExceptionId
 
 from . import SCENARIOS
-from .harness import DEFAULT_ARTIFACTS_DIR, REPO_ROOT, RunContext, run_rehearsal
+from .harness import DEFAULT_ARTIFACTS_DIR, REPO_ROOT, CiMetadata, RunContext, run_rehearsal
 
 EXIT_PASSED, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 _SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -75,6 +75,14 @@ def build_context(
             source=EvidenceSource.GITLAB_CI,
             pipeline_id=_positive_int(env, "CI_PIPELINE_ID"),
             job_id=_positive_int(env, "CI_JOB_ID"),
+            ci=CiMetadata(
+                project_id=_positive_int(env, "CI_PROJECT_ID"),
+                project_path=env.get("CI_PROJECT_PATH") or None,
+                ref=env.get("CI_COMMIT_REF_NAME") or None,
+                job_name=env.get("CI_JOB_NAME") or None,
+                pipeline_url=env.get("CI_PIPELINE_URL") or None,
+                job_url=env.get("CI_JOB_URL") or None,
+            ),
         )
 
     if source != EvidenceSource.LOCAL_SANDBOX:
@@ -98,6 +106,9 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
     parser = argparse.ArgumentParser(prog="python -m app.rehearsal", description="Run an approved GateDebt rehearsal.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="list approved scenarios")
+    summ = sub.add_parser("summarize", help="summarise CI rehearsal reports (self-check, not trust)")
+    summ.add_argument("evidence_dir", type=Path)
+    summ.add_argument("--out", type=Path, required=True)
     run = sub.add_parser("run", help="run one approved scenario")
     run.add_argument("scenario", choices=sorted(SCENARIOS))
     run.add_argument("--exception-id", required=True)
@@ -108,6 +119,7 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
         choices=[EvidenceSource.LOCAL_SANDBOX.value, EvidenceSource.GITLAB_CI.value],
     )
     run.add_argument("--artifacts-dir", type=Path, default=DEFAULT_ARTIFACTS_DIR)
+    run.add_argument("--evidence-out", type=Path, help="also write the report to this fixed path (for CI artifacts)")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -118,6 +130,11 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             print(f"{scenario_id}\tmode={cls.requirement.mode.value}\texercises={cls.exercised_check}")
         return EXIT_PASSED
 
+    if args.command == "summarize":
+        from .summary import main as summarize_main
+
+        return EXIT_PASSED if summarize_main(args.evidence_dir, args.out) == 0 else EXIT_FAILED
+
     try:
         ctx = build_context(args.exception_id, args.commit, args.source, env)
     except UsageError as exc:
@@ -125,6 +142,9 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
         return EXIT_USAGE
 
     report, path = run_rehearsal(SCENARIOS[args.scenario], ctx, args.artifacts_dir)
+    if args.evidence_out:
+        args.evidence_out.parent.mkdir(parents=True, exist_ok=True)
+        args.evidence_out.write_text(path.read_text())
     evidence = report.evidence
     print(f"scenario:       {evidence.scenario_id} ({evidence.mode.value})")
     print(f"run:            {evidence.run_id}  evidence: {evidence.id}")

@@ -134,6 +134,25 @@ CREATE TABLE audit_events (
 CREATE INDEX audit_exception ON audit_events(exception_id, seq);
 """
     + "".join(_append_only(t) for t in ("evidence", "approvals", "decisions", "verifications", "audit_events")),
+    # 2: server-side GitLab CI provenance for ingested evidence
+    """
+CREATE TABLE ci_verifications (
+    evidence_id TEXT PRIMARY KEY REFERENCES evidence(id),
+    exception_id TEXT NOT NULL REFERENCES exceptions(id),
+    project_id INTEGER NOT NULL,
+    pipeline_id INTEGER NOT NULL,
+    job_id INTEGER NOT NULL,
+    job_name TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    pipeline_web_url TEXT,
+    job_web_url TEXT,
+    verified_at TEXT NOT NULL,
+    verified_by TEXT NOT NULL,
+    UNIQUE (project_id, job_id)
+);
+"""
+    + _append_only("ci_verifications"),
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -263,7 +282,13 @@ class Store:
 
     def list_evidence(self, conn: sqlite3.Connection, exception_id: str) -> list[dict[str, Any]]:
         rows = conn.execute(
-            "SELECT * FROM evidence WHERE exception_id = ? ORDER BY finished_at, id", (exception_id,)
+            "SELECT e.*, c.project_id AS ci_project_id, c.pipeline_id AS ci_pipeline_id, c.job_id AS ci_job_id,"
+            " c.job_name AS ci_job_name, c.ref AS ci_ref, c.commit_sha AS ci_commit_sha,"
+            " c.pipeline_web_url AS ci_pipeline_web_url, c.job_web_url AS ci_job_web_url,"
+            " c.verified_at AS ci_verified_at, c.verified_by AS ci_verified_by"
+            " FROM evidence e LEFT JOIN ci_verifications c ON c.evidence_id = e.id"
+            " WHERE e.exception_id = ? ORDER BY e.finished_at, e.id",
+            (exception_id,),
         ).fetchall()
         return [
             {
@@ -272,9 +297,34 @@ class Store:
                 "working_tree_dirty": None if r["working_tree_dirty"] is None else bool(r["working_tree_dirty"]),
                 "recorded_at": r["recorded_at"],
                 "recorded_by": r["recorded_by"],
+                "ci_verification": None if r["ci_job_id"] is None else {
+                    key: r[f"ci_{key}"] for key in (
+                        "project_id", "pipeline_id", "job_id", "job_name", "ref", "commit_sha",
+                        "pipeline_web_url", "job_web_url", "verified_at", "verified_by")
+                },
             }
             for r in rows
         ]
+
+    def insert_ci_verification(
+        self, conn: sqlite3.Connection, exception_id: str, evidence_id: str, provenance: Any, verified_by: str
+    ) -> None:
+        try:
+            conn.execute(
+                "INSERT INTO ci_verifications (evidence_id, exception_id, project_id, pipeline_id, job_id, job_name,"
+                " ref, commit_sha, pipeline_web_url, job_web_url, verified_at, verified_by)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (evidence_id, exception_id, provenance.project_id, provenance.pipeline_id, provenance.job_id,
+                 provenance.job_name, provenance.ref, provenance.commit_sha, provenance.pipeline_web_url,
+                 provenance.job_web_url, iso(utcnow()), verified_by),
+            )
+        except sqlite3.IntegrityError as err:
+            raise DuplicateError(f"CI job {provenance.job_id} already ingested") from err
+
+    def ci_job_ingested(self, conn: sqlite3.Connection, project_id: int, job_id: int) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM ci_verifications WHERE project_id = ? AND job_id = ?", (project_id, job_id)
+        ).fetchone() is not None
 
     # -------------------------------------------------------------- approvals
 
