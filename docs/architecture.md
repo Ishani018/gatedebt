@@ -18,7 +18,9 @@ merge, or produce test results.
 | Lifecycle service (all state changes) | `backend/app/services/lifecycle.py` | done |
 | Auth boundary (dev header only; GitLab identity planned) | `backend/app/auth.py`, `backend/app/config.py` | done (dev only) |
 | FastAPI | `backend/app/api/main.py` | done |
-| GitLab CI | `.gitlab-ci.yml` | Milestone 5 |
+| GitLab CI pipeline | `.gitlab-ci.yml` | done (simulated locally; real run pending) |
+| GitLab API client (read-only) | `backend/app/integrations/gitlab.py` | done |
+| CI evidence verification + ingestion | `backend/app/services/ci_evidence.py`, `backend/app/ingest_ci.py` | done |
 | Orchestration (provider-neutral interface + labelled mock coordinator) | `backend/app/orchestration/` | Milestone 6 |
 | Dashboard (React + Vite, JavaScript) | `frontend/` | Milestone 7 |
 
@@ -95,13 +97,66 @@ is that ID; otherwise the decision engine reports the check as missing.
   exception's `affected_check` in each. The two scenarios exercise different
   checks, so no real evidence can currently satisfy that type. Needs a
   release-readiness scenario or a policy refinement.
-* The default policy trusts `local_sandbox` evidence (useful for the local
-  demo). A production policy should trust `gitlab_ci` only.
+* Development trusts `local_sandbox` evidence by default (useful for the local
+  demo); `GATEDEBT_EVIDENCE_TRUST=ci_only` switches it off, and production
+  always trusts verified `gitlab_ci` evidence only.
 * Dirty-tree evidence: flagged in the CLI report; excluded from decisions by
   the API lifecycle service (`EVIDENCE_UNCOMMITTED_SOURCE`).
-* CLI rehearsal reports are not imported into the database yet; only API-run
-  rehearsals are stored. CI evidence ingestion (reading job artifacts from
-  GitLab rather than accepting uploads) is Milestone 5.
+* Local CLI rehearsal reports are not imported into the database; only
+  API-run local rehearsals and server-verified CI reports are stored.
+
+## GitLab CI evidence
+
+### Trust model
+
+A CI report is a JSON file a job wrote. Anyone who can edit the file, the
+API request, or the database could claim anything, so none of those are
+trusted. What *is* trusted:
+
+1. **The GitLab API, reached with the server's own token** (HTTPS only; the
+   token is never logged, never in `repr`, and stripped from cross-host
+   redirects because artifact downloads may go through a CDN).
+2. **The code on a trusted ref.** The report is produced by the rehearsal
+   code at the pipeline's commit. Restricting `GATEDEBT_GITLAB_TRUSTED_REFS`
+   to protected branches means only reviewed code can produce trusted reports.
+
+### Verification (`verify_ci_evidence`)
+
+| Check | Reason code on failure |
+|---|---|
+| project in allowlist | `CI_PROJECT_NOT_TRUSTED` (403, GitLab not even called) |
+| pipeline exists / matches project | `CI_PIPELINE_NOT_FOUND`, `CI_PIPELINE_PROJECT_MISMATCH` |
+| pipeline `success` | `CI_PIPELINE_NOT_SUCCESSFUL` |
+| trusted ref, not a tag | `CI_REF_NOT_TRUSTED` |
+| caller's expected commit | `CI_COMMIT_MISMATCH` |
+| latest `rehearse:<scenario>` job in the pipeline | `CI_JOB_NOT_FOUND`, `CI_JOB_MISMATCH` |
+| job `success`, same commit, has timestamps | `CI_JOB_NOT_SUCCESSFUL`, `CI_JOB_COMMIT_MISMATCH`, `CI_JOB_TIMESTAMPS_MISSING` |
+| artifact present and a valid report | `CI_ARTIFACT_MISSING`, `CI_ARTIFACT_MALFORMED` |
+| report source/pipeline/job/commit/project/scenario/exception | `CI_REPORT_*_MISMATCH` |
+| report timestamps inside the job's run | `CI_REPORT_OUTSIDE_JOB_WINDOW` |
+| existing policy (`evidence_rejections`) | `EVIDENCE_DIGEST_MISMATCH`, `EVIDENCE_TOO_OLD`, `EVIDENCE_FROM_FUTURE`, ... |
+| verdict recomputed (`rehearsal_failures`) | `CI_REHEARSAL_FAILED` + check codes |
+| GitLab unreachable / 5xx / auth error / not configured | `CI_VERIFICATION_UNAVAILABLE` / `..._NOT_CONFIGURED` (503) |
+
+On success the evidence row and a `ci_verifications` row (project, pipeline,
+job, ref, commit, URLs, who/when) are written in one transaction.
+`UNIQUE(project_id, job_id)` plus a pre-check keep it to one record per job.
+`ci_verifications` is append-only (migration 2).
+
+Defence in depth: any stored `gitlab_ci` evidence **without** a
+`ci_verifications` row is excluded from decisions
+(`EVIDENCE_CI_PROVENANCE_UNVERIFIED`), so a row written straight into the
+database cannot count.
+
+### Who can trigger ingestion
+
+| Path | Authentication | Use |
+|---|---|---|
+| `POST /exceptions/{id}/ci-evidence` | any identity from the configured `Authenticator` (today: dev header only; production: none → 401) | development / demo |
+| `python -m app.ingest_ci` | shell access to the server; audited as `system:operator-cli` | production until real HTTP auth exists |
+
+Ingestion only ever stores evidence that GitLab vouches for, so the caller's
+identity controls *who may ask*, not *what is believed*.
 
 ## Storage
 

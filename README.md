@@ -18,8 +18,8 @@ the waiver once the remediation is merged and verified.
 | 2. Deterministic backend (models, policy, evidence validation, decisions) | done |
 | 3. Rehearsal engine (sandbox + pipeline scenarios, CLI, sealed evidence) | done |
 | 4. API & SQLite persistence | done |
-| 5. GitLab CI/CD | next |
-| 6. Orchestration (mock coordinator, Duo boundary) | planned |
+| 5. GitLab CI/CD + verified CI evidence ingestion | done (pipeline simulated locally; first real GitLab run pending) |
+| 6. Orchestration (mock coordinator, Duo boundary) | next |
 | 7. React dashboard | planned |
 | 8. End-to-end verification | planned |
 | 9. Docs & demo script | planned |
@@ -121,6 +121,98 @@ curl -X POST localhost:8000/exceptions/EXC-001/verifications -H "$H" -H 'X-GateD
 Rehearsals run against the local git `HEAD`. If the working tree has
 uncommitted changes, the evidence is stored but flagged
 `EVIDENCE_UNCOMMITTED_SOURCE` and cannot support retirement. Commit first.
+
+## GitLab CI/CD
+
+`.gitlab-ci.yml` runs on `python:3.12-slim` from a clean checkout:
+
+| Stage | Job | What it does | Artifacts (30 days) |
+|---|---|---|---|
+| validate | `validate` | byte-compile, list approved scenarios, check fixture JSON | – |
+| test | `test` | full pytest suite | JUnit (`junit-tests.xml`) |
+| rehearse | `rehearse:db-migration-recovery` | real SQLite migration failure + recovery in the job's temp dir | `gatedebt-evidence/db-migration-recovery.json`, `artifacts/runs/` |
+| rehearse | `rehearse:pipeline-gate-recovery` | real gate failure, classification, recovery, retry | `gatedebt-evidence/pipeline-gate-recovery.json`, `artifacts/runs/` |
+| evaluate | `evidence-summary` | self-check of both reports; table in the job log | `gatedebt-summary/summary.json`, JUnit of every rehearsal check |
+
+* All jobs are safe to run automatically: rehearsals only touch throwaway files
+  inside the job container. The pipeline uses **no secrets**.
+* Reports are published even when a rehearsal fails (`artifacts: when: always`),
+  but the job fails, so the pipeline fails and the report can never be ingested.
+* Each report records the GitLab project, pipeline, job, ref, commit and
+  timestamps — as *self-reported* metadata. Trust comes from the server check below.
+* Choose which exceptions the rehearsals are evidence for with the pipeline
+  variables `GATEDEBT_DB_EXCEPTION_ID` (default `EXC-001`) and
+  `GATEDEBT_PIPELINE_EXCEPTION_ID` (default `EXC-002`) under
+  *Build → Pipelines → Run pipeline*.
+
+### Ingesting CI evidence (server-verified)
+
+```bash
+# HTTP (development auth header shown)
+curl -X POST localhost:8000/exceptions/EXC-001/ci-evidence -H 'content-type: application/json' \
+  -H 'X-GateDebt-Dev-User: user:alice' -d '{"pipeline_id": 1234, "scenario_id": "db-migration-recovery"}'
+# or on the server itself (production path; audited as system:operator-cli)
+python -m app.ingest_ci --exception-id EXC-001 --pipeline-id 1234 --scenario db-migration-recovery
+```
+
+The caller supplies only **pointers** (pipeline ID, scenario, optionally project
+ID / job ID / expected commit). Any other field — `source`, `status`, a report —
+is rejected with 422. The server then, with its own read-only token:
+
+1. requires the project to be in `GATEDEBT_GITLAB_PROJECT_IDS`;
+2. reads the pipeline: same project, `status == success`, ref in
+   `GATEDEBT_GITLAB_TRUSTED_REFS`, not a tag, commit matches `commit_sha` if given;
+3. finds the latest `rehearse:<scenario>` job in that pipeline: `success`,
+   same pipeline and commit;
+4. downloads `gatedebt-evidence/<scenario>.json` from that job's artifacts;
+5. checks the report: `source=gitlab_ci`, pipeline/job/commit/project/
+   scenario/exception all match what GitLab said, timestamps inside the job's
+   run window, digest valid, not stale/expired/future-dated (existing policy),
+   and the verdict **recomputed** by the policy engine;
+6. stores the evidence and its CI verification in one transaction (one record
+   per CI job; duplicates → 409).
+
+GitLab errors or missing configuration → **503**, nothing stored. Every
+rejection is audited. Ingested evidence never changes an exception's status:
+proposal, human approval and post-merge verification are still required.
+
+| | Local rehearsal evidence | Verified GitLab CI evidence |
+|---|---|---|
+| Produced by | `POST /rehearsals` or the CLI on a developer machine | the `rehearse:*` jobs |
+| Stored via | `POST /exceptions/{id}/rehearsals` (dev only) | `POST .../ci-evidence` or `python -m app.ingest_ci` |
+| Commit binding | local `HEAD`; uncommitted changes → excluded | the pipeline's commit, as reported by GitLab |
+| Counts when | `GATEDEBT_EVIDENCE_TRUST=local_and_ci` (dev default) | always (if verified) |
+| Production | never trusted | the only trusted source |
+
+### Putting it on GitLab (manual steps)
+
+1. Create a **public** project on gitlab.com and push this branch as `main`:
+   `git remote add gitlab git@gitlab.com:<you>/gatedebt.git && git push gitlab HEAD:main`
+2. Keep `main` protected (Settings → Repository → Protected branches); only
+   protected refs should be listed in `GATEDEBT_GITLAB_TRUSTED_REFS`, because
+   anyone who can push to a trusted ref can change the rehearsal code.
+3. Make sure a runner is available (Settings → CI/CD → Runners → instance
+   runners; gitlab.com may ask you to verify your account first).
+4. The pipeline runs on push. No CI/CD variables or secrets are needed.
+5. For the server: create a token with only the `read_api` scope — a project
+   access token with the Reporter role if your plan offers it, otherwise a
+   personal access token with a short expiry. Set `GATEDEBT_GITLAB_URL`,
+   `GATEDEBT_GITLAB_TOKEN`, `GATEDEBT_GITLAB_PROJECT_IDS` (the numeric ID on
+   the project overview page) and `GATEDEBT_GITLAB_TRUSTED_REFS=main` in the
+   server's environment. Never in the repository or `.gitlab-ci.yml`.
+
+### End-to-end demo path
+
+1. Push to GitLab; wait for the pipeline to go green (5 jobs).
+2. Start the API with `GATEDEBT_EVIDENCE_TRUST=ci_only`, the GitLab settings
+   above and `GATEDEBT_APPROVERS=user:bob`.
+3. Create `EXC-001` (`affected_check: integration:migration_0042`).
+4. `GET /exceptions/EXC-001/decision?commit=<pipeline sha>` → `keep_open`.
+5. `POST /exceptions/EXC-001/ci-evidence` with the pipeline ID → 201, linked to
+   the job URL. Decision → `propose_retirement`; status still `active`.
+6. Propose as `agent:mock`, try to approve as the agent (403), approve as
+   `user:bob`, submit a verification with the waiver still present (not
+   retired), then a clean one → `retired`. `GET /audit` shows every step.
 
 ## Docs
 
