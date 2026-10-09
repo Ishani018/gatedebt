@@ -298,6 +298,8 @@ class Lifecycle:
         """
         identity = self._require_identity(identity)
         settings = self.settings
+        if not settings.ci_verification_configured:
+            raise Unavailable("CI_VERIFICATION_NOT_CONFIGURED")
         if project_id is None:
             if len(settings.gitlab_project_ids) != 1:
                 raise Invalid("CI_PROJECT_ID_REQUIRED")

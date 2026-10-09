@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "gatedebt": {
+      "type": "stdio",
+      "command": "/ABSOLUTE/PATH/TO/gatedebt/.venv/bin/python",
+      "args": ["-m", "app.duo.mcp_server"],
+      "cwd": "/ABSOLUTE/PATH/TO/gatedebt/backend",
+      "env": {
+        "GATEDEBT_DB_PATH": "/ABSOLUTE/PATH/TO/gatedebt/gatedebt.sqlite3"
+      },
+      "approvedTools": ["list_exceptions", "get_exception", "get_evidence", "get_decision", "retirement_brief"]
+    }
+  }
+}

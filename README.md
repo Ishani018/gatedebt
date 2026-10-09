@@ -19,13 +19,14 @@ the waiver once the remediation is merged and verified.
 | 3. Rehearsal engine (sandbox + pipeline scenarios, CLI, sealed evidence) | done |
 | 4. API & SQLite persistence | done |
 | 5. GitLab CI/CD + verified CI evidence ingestion | done (pipeline simulated locally; first real GitLab run pending) |
-| 6. Orchestration (mock coordinator, Duo boundary) | next |
+| 6. GitLab Duo integration, Path A: local MCP server (read-only + bounded tools) | implemented and tested locally; not yet invoked from a real Duo client |
 | 7. React dashboard | planned |
 | 8. End-to-end verification | planned |
 | 9. Docs & demo script | planned |
 
-GitLab Duo Agent Platform is **not** integrated yet (access approved; design in [docs/duo-integration.md](docs/duo-integration.md)). Nothing in
-this repository claims otherwise.
+GitLab Duo: a GateDebt **MCP server** for Duo Agentic Chat / Duo CLI is implemented
+(see [GitLab Duo (MCP)](#gitlab-duo-mcp)). It has been tested with the official MCP SDK
+client, **not yet with a real Duo session**. No GitLab-hosted agent or flow exists yet.
 
 ## Local development
 
@@ -214,9 +215,44 @@ proposal, human approval and post-merge verification are still required.
    `user:bob`, submit a verification with the waiver still present (not
    retired), then a clean one → `retired`. `GET /audit` shows every step.
 
+## GitLab Duo (MCP)
+
+`backend/app/duo/` is a local **stdio MCP server** (official `mcp` Python SDK)
+that GitLab Duo Agentic Chat (VS Code, JetBrains) or the GitLab Duo CLI starts
+from `.gitlab/duo/mcp.json`. It acts as the fixed identity `agent:duo-mcp`
+against your local GateDebt database.
+
+| Tool | Kind | Notes |
+|---|---|---|
+| `list_exceptions`, `get_exception`, `get_evidence`, `get_decision` | read-only | same data and rules as the HTTP API |
+| `retirement_brief` | read-only | GateDebt's deterministic decision + template-based explanation, evidence used/rejected, next **human** steps |
+| `run_rehearsal` | stateful, opt-in | approved scenario enum only; development only; dirty tree → does not qualify |
+| `ingest_ci_evidence` | stateful, opt-in | pointers only; existing server-side GitLab verification |
+
+Not available to the agent at all: propose, approve, reject, renew, verify,
+create/edit exceptions, free-text, paths, URLs, commands or SQL. Every input
+schema is closed (`additionalProperties: false`), every string argument is a
+pattern or an enum, internal errors are never shown to the model, and every
+call is audited as `agent.tool_called`.
+
+Set up (on your machine):
+
+```bash
+cp .gitlab/duo/mcp.json.example .gitlab/duo/mcp.json   # git-ignored
+# edit the three /ABSOLUTE/PATH/TO/gatedebt placeholders
+# optional: add "--enable-stateful-tools" to "args" to expose run_rehearsal / ingest_ci_evidence
+```
+
+Then in the top-level group: *Settings → GitLab Duo → Change configuration →
+Allow external MCP tools*, restart the IDE/Duo CLI, open Agentic Chat in this
+workspace and ask e.g. *"Use GateDebt to explain whether EXC-001 can be retired."*
+Read tools are pre-approved in the example config; stateful tools always ask
+you to confirm each call.
+
 ## Docs
 
 * [Architecture, lifecycle and evidence rules](docs/architecture.md)
+* [GitLab Duo integration](docs/duo-integration.md)
 
 ## License
 

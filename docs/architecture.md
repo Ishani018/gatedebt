@@ -21,7 +21,7 @@ merge, or produce test results.
 | GitLab CI pipeline | `.gitlab-ci.yml` | done (simulated locally; real run pending) |
 | GitLab API client (read-only) | `backend/app/integrations/gitlab.py` | done |
 | CI evidence verification + ingestion | `backend/app/services/ci_evidence.py`, `backend/app/ingest_ci.py` | done |
-| Orchestration (provider-neutral interface + labelled mock coordinator) | `backend/app/orchestration/` | Milestone 6 |
+| Duo MCP server (Path A: read-only + opt-in bounded tools as `agent:duo-mcp`) | `backend/app/duo/` | implemented; tested with MCP SDK client, not yet a real Duo session |
 | Dashboard (React + Vite, JavaScript) | `frontend/` | Milestone 7 |
 
 ## Exception lifecycle

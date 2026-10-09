@@ -1,6 +1,25 @@
 # GitLab Duo Agent Platform integration (proposal)
 
-Status: **design only — nothing below is implemented or connected yet.**
+Status (2026-10-09): **Path A is implemented and tested locally** (`backend/app/duo/`,
+`.gitlab/duo/mcp.json.example`), using the official MCP Python SDK 1.30. It has
+been exercised through the SDK's own client (in-memory and over a real stdio
+subprocess). **No real GitLab Duo client has invoked it yet**, so it is not
+yet "connected to Duo". Path B (GitLab-hosted flow) is not implemented.
+
+Three different things, kept separate:
+
+1. **Local MCP server used by a Duo client** — implemented (this repo).
+2. **GitLab-hosted custom agents / flows** — not implemented.
+3. **A real, authenticated Duo account session using it** — not yet done; needs
+   the manual steps in the README on a machine signed in to GitLab.
+
+Correction to the earlier proposal: the `retirement_brief` and all reads are
+implemented as designed. Additions found during implementation: the server
+re-validates arguments with strict models, inlines JSON-schema `$ref`s for
+client compatibility, never returns internal exception text, and lists
+stateful tools only with `--enable-stateful-tools`. Ingestion now answers
+`CI_VERIFICATION_NOT_CONFIGURED` (503) before any other check when GitLab
+verification is not configured.
 Every capability listed was checked against GitLab's own documentation sources
 (`gitlab-org/gitlab` `doc/user/duo_agent_platform/**`,
 `doc/user/gitlab_duo/model_context_protocol/**`, and the flow registry v1 spec
@@ -83,8 +102,10 @@ paraphrase it in chat, but nothing it says is read back as data or evidence.
 Every MCP call is audited (`agent.tool_called`, tool name, exception ID,
 outcome — no arguments beyond IDs, no secrets).
 
-Dependency: the official MCP Python SDK (`mcp`) — needed to speak the
-protocol correctly; tests drive the server through the SDK's own client.
+Dependency: the official MCP Python SDK (`mcp>=1.30,<2`), low-level `Server`
+API. `.gitlab/duo/mcp.json` uses only documented fields (`type`, `command`,
+`args`, `cwd`, `env`, `approvedTools`); the committed file is
+`mcp.json.example` because commands need absolute local paths.
 
 ### Path B — custom flow on pipeline events (optional, after A works)
 
