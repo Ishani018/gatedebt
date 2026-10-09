@@ -13,7 +13,7 @@ merge, or produce test results.
 | Models (Exception, Evidence, Decision, Approval, Verification, Audit) | `backend/app/models/` | done |
 | Policy engine (expiry, completeness, transitions, evidence validation, renewal/retirement rules) | `backend/app/services/policy.py` | done |
 | Decision engine (recommendation + reason codes) | `backend/app/services/decision.py` | done |
-| Rehearsal engine (sandbox DB-migration, pipeline gate) | `backend/app/rehearsal/`, `scenarios/` | Milestone 3 |
+| Rehearsal engine (sandbox DB-migration, pipeline gate) + CLI | `backend/app/rehearsal/`, `scenarios/` | done |
 | Persistence (SQLite, append-only audit/evidence/approvals) | `backend/app/store.py` | Milestone 4 |
 | FastAPI | `backend/app/api/` | Milestone 4 |
 | GitLab CI | `.gitlab-ci.yml` | Milestone 5 |
@@ -65,6 +65,38 @@ Then the **outcome** of the latest usable run per required scenario:
 | Expired, no usable evidence | `renewal_requires_approval` | yes |
 | Due or repeatedly renewed, no evidence | `investigate` | no |
 | Otherwise | `keep_open` | no |
+
+## Rehearsal engine
+
+`run_rehearsal()` (`backend/app/rehearsal/harness.py`):
+
+1. Creates a fresh temporary directory; the scenario may only touch files in it.
+2. Runs the scenario. Scenarios record what they **observed** through a
+   `Recorder`; nothing is passing by default and a check that never ran is
+   simply absent (→ `CHECK_MISSING`).
+3. Any unplanned exception → `unexpected_infrastructure`. A scenario that ends
+   without classifying its injected failure is also treated that way.
+4. Always releases resources, removes the directory, then **verifies** both
+   (directory gone, no open SQLite connections) → `verified` / `failed`.
+5. Writes `rehearsal.log`, seals an `EvidenceRecord` (log SHA-256 as an
+   artifact reference), and computes the verdict with the policy engine's own
+   `rehearsal_failures()`, so the harness can never be more lenient than policy.
+6. Writes `report.json` for passing **and** failing runs.
+
+Each scenario declares the one waived check it genuinely executes
+(`exercised_check`). Evidence only covers an exception whose `affected_check`
+is that ID; otherwise the decision engine reports the check as missing.
+
+### Known gaps (to resolve in later milestones)
+
+* `waived_release_readiness_check` requires both scenarios **and** the
+  exception's `affected_check` in each. The two scenarios exercise different
+  checks, so no real evidence can currently satisfy that type. Needs a
+  release-readiness scenario or a policy refinement.
+* The default policy trusts `local_sandbox` evidence (useful for the local
+  demo). A production policy should trust `gitlab_ci` only.
+* `local_git_head` evidence from a dirty working tree is flagged in the report
+  but not rejected by policy.
 
 ## Storage decision
 

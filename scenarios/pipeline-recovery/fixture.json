@@ -1,0 +1,11 @@
+{
+  "gate_script": "gate.py",
+  "lockfile": "requirements.lock",
+  "fault": "stale_lock_digest",
+  "stale_lock_content": "# lockfile before the dependency bump\nfastapi==0.110.0\n",
+  "expected_exit_code": 3,
+  "expected_failure_code": "LOCK_DIGEST_MISMATCH",
+  "recovery_procedure": "regenerate_lock_digest",
+  "timeout_seconds": 30,
+  "max_retries": 1
+}

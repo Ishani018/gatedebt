@@ -1,0 +1,21 @@
+{
+  "seed": "seed.sql",
+  "broken_migration": "migration_0042_broken.sql",
+  "fixed_migration": "migration_0042_fixed.sql",
+  "from_version": 41,
+  "to_version": 42,
+  "partial_artifact_table": "customer_tiers",
+  "expected_error": {
+    "type": "OperationalError",
+    "message_contains": "Cannot add a NOT NULL column with default value NULL"
+  },
+  "expected_customer_columns": [
+    ["id", "INTEGER", 0, null],
+    ["email", "TEXT", 1, null],
+    ["name", "TEXT", 1, null],
+    ["created_at", "TEXT", 1, null],
+    ["tier", "TEXT", 1, "'standard'"]
+  ],
+  "expected_row_counts": {"customers": 5, "invoices": 6},
+  "expected_default_tier": "standard"
+}
