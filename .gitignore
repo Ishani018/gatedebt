@@ -11,5 +11,7 @@ frontend/dist/
 # Local state and secrets
 .env
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 *.db
 artifacts/runs/

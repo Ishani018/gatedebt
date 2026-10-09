@@ -14,8 +14,10 @@ merge, or produce test results.
 | Policy engine (expiry, completeness, transitions, evidence validation, renewal/retirement rules) | `backend/app/services/policy.py` | done |
 | Decision engine (recommendation + reason codes) | `backend/app/services/decision.py` | done |
 | Rehearsal engine (sandbox DB-migration, pipeline gate) + CLI | `backend/app/rehearsal/`, `scenarios/` | done |
-| Persistence (SQLite, append-only audit/evidence/approvals) | `backend/app/store.py` | Milestone 4 |
-| FastAPI | `backend/app/api/` | Milestone 4 |
+| Persistence (SQLite, append-only audit/evidence/approvals) | `backend/app/store.py` | done |
+| Lifecycle service (all state changes) | `backend/app/services/lifecycle.py` | done |
+| Auth boundary (dev header only; GitLab identity planned) | `backend/app/auth.py`, `backend/app/config.py` | done (dev only) |
+| FastAPI | `backend/app/api/main.py` | done |
 | GitLab CI | `.gitlab-ci.yml` | Milestone 5 |
 | Orchestration (provider-neutral interface + labelled mock coordinator) | `backend/app/orchestration/` | Milestone 6 |
 | Dashboard (React + Vite, JavaScript) | `frontend/` | Milestone 7 |
@@ -95,12 +97,73 @@ is that ID; otherwise the decision engine reports the check as missing.
   release-readiness scenario or a policy refinement.
 * The default policy trusts `local_sandbox` evidence (useful for the local
   demo). A production policy should trust `gitlab_ci` only.
-* `local_git_head` evidence from a dirty working tree is flagged in the report
-  but not rejected by policy.
+* Dirty-tree evidence: flagged in the CLI report; excluded from decisions by
+  the API lifecycle service (`EVIDENCE_UNCOMMITTED_SOURCE`).
+* CLI rehearsal reports are not imported into the database yet; only API-run
+  rehearsals are stored. CI evidence ingestion (reading job artifacts from
+  GitLab rather than accepting uploads) is Milestone 5.
 
-## Storage decision
+## Storage
 
-One authority: **SQLite** (stdlib `sqlite3`, no ORM). Exceptions are mutable
-rows guarded by the transition table; evidence, approvals and audit events are
-insert-only. GitLab is a *source* of evidence (pipelines, artifacts) and a
-*target* for proposals (issues/MRs), never a second copy of registry state.
+One authority: **SQLite** (stdlib `sqlite3`, no ORM, `backend/app/store.py`).
+GitLab is a *source* of evidence (pipelines, artifacts) and a *target* for
+proposals (issues/MRs), never a second copy of registry state. No YAML registry.
+
+* **Schema versioning:** ordered migrations in `MIGRATIONS`, tracked with
+  `PRAGMA user_version`, each applied in its own transaction. A database newer
+  than the code is refused.
+* **Append-only:** `evidence`, `approvals`, `decisions` (proposal snapshots),
+  `verifications` and `audit_events` have `BEFORE UPDATE/DELETE` triggers that
+  abort. `exceptions` rows cannot be deleted; they change only through the
+  lifecycle service.
+* **Transactions:** every write is one `BEGIN IMMEDIATE` transaction holding
+  the state change and its audit events, so a crash leaves no partial write and
+  concurrent read-check-write sequences serialise. Exception updates also carry
+  an optimistic `WHERE status = ? AND updated_at = ?` guard.
+* **Timestamps:** columns use fixed-width UTC (`2026-01-01T00:00:00.000000Z`) so
+  text order equals time order; full records are stored as validated model JSON.
+* **WAL mode** for concurrent readers alongside one writer.
+
+## API and lifecycle service
+
+Handlers in `app/api/main.py` only translate HTTP. `app/services/lifecycle.py`
+is the single code path that changes state, and it delegates every rule to the
+existing policy/decision engines:
+
+* `GET /decision` calls `decision.evaluate()` and writes nothing.
+* A proposal requires `evaluate()` to return `propose_retirement`, then moves
+  `active → retirement_proposed` and stores the decision snapshot.
+* A retirement approval re-runs `evaluate()` against the proposal's commit; if
+  newer or aged-out evidence means it is no longer eligible, it is refused.
+* Renewals use `renewal_issues()`; retirement uses `retirement_issues()` with
+  the stored approval and the submitted verification.
+* Every refusal (401/403/409/422 on approvals, proposals, verifications) is
+  written to the audit trail. Audit details hold IDs, reason codes and auth
+  method only — no headers, tokens or request bodies.
+
+### Evidence provenance (beyond the policy engine)
+
+Before evidence reaches `evaluate()`, stored source-state metadata is checked:
+evidence from a working tree with uncommitted changes
+(`EVIDENCE_UNCOMMITTED_SOURCE`) or unknown tree state for a local HEAD
+(`EVIDENCE_SOURCE_STATE_UNKNOWN`) is excluded and reported in
+`rejected_evidence`. Local rehearsals through the API always run against the
+local git HEAD, and are refused entirely in production.
+
+### Identity and authorisation
+
+| | development | production |
+|---|---|---|
+| Authenticator | `DevHeaderAuthenticator` — trusts `X-GateDebt-Dev-User`, `verified=False` | none yet → every write 401 |
+| Trusted evidence | `local_sandbox`, `gitlab_ci` | `gitlab_ci` only |
+| Local rehearsals | allowed | 403 |
+| Manual verification | allowed (human/CI actors) | 403 — must come from GitLab |
+| Approvals | human actor in `GATEDEBT_APPROVERS` | also requires `verified=True` |
+
+Always: agents and CI cannot approve (`APPROVER_MUST_BE_HUMAN`); the actor who
+proposed a retirement cannot approve it (`SELF_APPROVAL_FORBIDDEN`); agents
+cannot submit verifications. Configuring `dev-header` with `production` fails
+at startup.
+
+The future GitLab integration implements `Authenticator.authenticate(request)
+-> Identity | None` with `verified=True`; nothing else needs to change.
