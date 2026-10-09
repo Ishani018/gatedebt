@@ -503,6 +503,13 @@ def test_gitlab_ci_yaml_matches_trust_contract():
     config = yaml.safe_load((REPO_ROOT / ".gitlab-ci.yml").read_text())
     assert config["stages"] == ["validate", "test", "rehearse", "evaluate"]
     assert config["default"]["image"].startswith("python:3.12")
+    # Keywords GitLab accepts under `default:` (CI/CD YAML reference); anything
+    # else makes the whole pipeline invalid.
+    allowed_default = {"after_script", "artifacts", "before_script", "cache", "hooks", "id_tokens", "image",
+                       "interruptible", "retry", "services", "tags"}
+    assert set(config["default"]) <= allowed_default
+    for job in ("validate", "test", ".rehearse", "evidence-summary"):
+        assert config[job]["timeout"].endswith("minutes")
     from app.rehearsal import SCENARIOS
     for scenario_id in SCENARIOS:
         job = config[ci_job_name(scenario_id)]

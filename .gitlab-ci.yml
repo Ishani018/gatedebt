@@ -48,7 +48,6 @@ stages:
 default:
   image: python:3.12-slim
   interruptible: true
-  timeout: 15 minutes
   cache:
     key:
       files:
@@ -62,6 +61,7 @@ default:
 
 validate:
   stage: validate
+  timeout: 10 minutes
   script:
     - cd backend
     - python -m compileall -q app
@@ -71,6 +71,7 @@ validate:
 
 test:
   stage: test
+  timeout: 15 minutes
   script:
     - cd backend
     - python -m pytest --junitxml="$CI_PROJECT_DIR/junit-tests.xml"
@@ -85,6 +86,7 @@ test:
 # status: the report is published even on failure, but the job still fails.
 .rehearse:
   stage: rehearse
+  timeout: 10 minutes
   needs: [test]
   script:
     - cd backend
@@ -117,6 +119,7 @@ test:
 
 evidence-summary:
   stage: evaluate
+  timeout: 10 minutes
   needs:
     - job: "rehearse:db-migration-recovery"
       artifacts: true

@@ -24,7 +24,7 @@ the waiver once the remediation is merged and verified.
 | 8. End-to-end verification | planned |
 | 9. Docs & demo script | planned |
 
-GitLab Duo Agent Platform is **not** integrated yet (access pending). Nothing in
+GitLab Duo Agent Platform is **not** integrated yet (access approved; design in [docs/duo-integration.md](docs/duo-integration.md)). Nothing in
 this repository claims otherwise.
 
 ## Local development
